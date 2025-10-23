@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import tokenizer as Tokenizer
+import data_loader as dl
 
 class InputEmbeddings(nn.Module):
     def __init__(self, vocab_size, embedding_dim):
@@ -216,13 +218,13 @@ class Transformer(nn.Module):
     def project(self, x):
         return self.projection_layer(x)
     
-def build_transformer(vocab_size: int, embedding_dim: int = 1024, num_heads: int = 8, num_encoder_layers: int = 6, num_decoder_layers: int = 6, dropout: float = 0.1, d_ff = 2048) -> Transformer:
+def build_transformer(vocab_size: int, embedding_dim: int = 1024, src_seq_len: int = 256, num_heads: int = 8, num_encoder_layers: int = 6, num_decoder_layers: int = 6, dropout: float = 0.1, d_ff = 2048) -> Transformer:
     # Embedding layers
     src_embedding = InputEmbeddings(vocab_size, embedding_dim)
     tgt_embedding = InputEmbeddings(vocab_size, embedding_dim)
 
     # Positional encodings (only one required)
-    pos_encoding = PositionalEncoding(embedding_dim)
+    pos_encoding = PositionalEncoding(embedding_dim, src_seq_len, dropout)
 
     # Create the encoder blocks
     encoder_blocks = nn.ModuleList([EncoderBlock(
@@ -255,3 +257,8 @@ def build_transformer(vocab_size: int, embedding_dim: int = 1024, num_heads: int
             nn.init.xavier_uniform_(p)
 
     return transformer
+
+if __name__ == "__main__":
+    transformer = build_transformer(16384)
+    tokenizer = Tokenizer.Tokenizer(16384)
+    dl.get_ds(tokenizer)
