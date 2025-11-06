@@ -1,4 +1,4 @@
-import tokenizer, os, json
+import os, json
 
 def gather_datas():
     content = ""
@@ -16,7 +16,3 @@ def gather_datas():
                     content += "<|who_i_am|>" + data[key]["author"] + "<|end_who_i_am|>" + "<|bos|>" + data[key]["content"] + "<|eos|>" + "\n"
 
     return content
-
-def get_ds(tokenizer):
-
-    print(gather_datas())

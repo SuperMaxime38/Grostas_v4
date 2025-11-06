@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import tokenizer as Tokenizer
 import data_loader as dl
+import math
 
 class InputEmbeddings(nn.Module):
     def __init__(self, vocab_size, embedding_dim):
@@ -40,12 +41,12 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + (self.pe[:, :x.shape[1]]).requires_grad(False)
+        x = x + self.pe[:, :x.shape[1]].detach()
         return self.dropout(x)
 
 class LayerNormalization(nn.Module):
 
-    def __init__(self, eps: float = 10**-6) -> None:
+    def __init__(self, eps: float = 1e-5) -> None:
         super().__init__()
         self.eps = eps
         self.alpha = nn.Parameter(torch.ones(1)) #Multiplicative
@@ -88,20 +89,27 @@ class MultiHeadAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     @staticmethod
-    def attention(query, key, value,dropout: nn.Dropout, mask=None):
-        d_k = query.shape[-1]
-
-        # (Batch, num_heads, sequence_length, head_dim)
-        attention_scores = (query @ key.transpose(-2, -1)) / d_k**0.5
+    def attention(query, key, value, dropout: nn.Dropout, mask=None):
+        d_k = query.size(-1)
+        scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
 
         if mask is not None:
-            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
-        attention_scores = attention_scores.softmax(dim=-1)
+            # Vérifie que mask est broadcastable
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            elif mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+
+        # Stabilisation numérique : soustraction du max
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        attn = scores.softmax(dim=-1)
 
         if dropout is not None:
-            attention_scores = dropout(attention_scores)
+            attn = dropout(attn)
 
-        return (attention_scores @ value), attention_scores
+        output = attn @ value
+        return output, attn
 
 
     def forward(self, v, k, q, mask=None):
@@ -167,6 +175,9 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, enc_out, src_mask, tgt_mask): # src_mask is coming from encoder
         x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
+        src_mask = src_mask if src_mask is not None else torch.ones(
+            (x.size(0), 1, 1, enc_out.size(1)), device=x.device
+        )
         x = self.residual_connection[1](x, lambda x: self.cross_attention_block(x, enc_out, enc_out, src_mask))
         x = self.residual_connection[2](x, self.feed_forward_block)
         return x
@@ -191,7 +202,7 @@ class ProjectionLayer(nn.Module):
 
     def forward(self, x):
         # (Batch, sequence_length, embedding_dim) -> (Batch, sequence_length, vocab_size)
-        return torch.log_softmax(self.proj(x), dim=-1)
+        return self.proj(x)
     
 class Transformer(nn.Module):
 
@@ -258,7 +269,16 @@ def build_transformer(vocab_size: int, embedding_dim: int = 1024, src_seq_len: i
 
     return transformer
 
+def get_model():
+    return build_transformer(16384)
+
 if __name__ == "__main__":
     transformer = build_transformer(16384)
     tokenizer = Tokenizer.Tokenizer(16384)
-    dl.get_ds(tokenizer)
+    dataset = dl.get_ds(tokenizer) #a byte list
+
+    #Keep 90% for training
+    # train_ds_size = int(0.9 * len(dataset))
+    # val_ds_size = len(dataset) - train_ds_size
+    # train_ds, val_ds = torch.utils.data.random_split(dataset, [train_ds_size, val_ds_size])
+    # print(train_ds.dataset , "\n\n\n" , val_ds.dataset)
