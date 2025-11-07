@@ -4,12 +4,41 @@ import torch.optim as optim
 import model as mdl
 import tokenizer as tkn
 import data_loader as dl
+import os
 
 from inference import generate
 
 # ============================
 # CONFIGURATION DE BASE
 # ============================
+
+last_saved_epoch = 0
+
+def save_model(model, optimizer, epoch, loss, path="checkpoints/transformer.pt"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, path)
+    print(f"✅ Modèle sauvegardé dans {path}")
+
+def load_model(model_class, checkpoint_path, device, **model_kwargs):
+    if os.path.exists(checkpoint_path) == False:
+        return model_class(**model_kwargs)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Reconstruit un modèle vierge avec la même architecture
+    model = model_class(**model_kwargs)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.train()  # ou .train() si tu veux continuer l'entraînement
+
+    global last_saved_epoch
+    last_saved_epoch = checkpoint['epoch']
+
+    print(f"✅ Modèle chargé depuis {checkpoint_path} (epoch {checkpoint['epoch']}, loss={checkpoint['loss']:.4f})")
+    return model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("using device:", device)
@@ -18,11 +47,12 @@ vocab_size = 16384                  # Ton vocabulaire
 seq_len = 256                       # Longueur max de séquence
 embedding_dim = 1024
 batch_size = 8
-num_epochs = 10
+num_epochs = 100
 lr = 1e-5
 
 # Construction du modèle
 model = mdl.get_model()
+model = load_model(mdl.build_transformer, "checkpoints/transformer.pt", device, vocab_size=vocab_size, src_seq_len=seq_len, embedding_dim=embedding_dim)
 model = model.to(device)
 
 criterion = nn.CrossEntropyLoss(ignore_index=0)  # supposer que token 0 = padding
@@ -35,6 +65,7 @@ def train_model():
     dataset_tokens = tokenizer.encode(dl.gather_datas())
 
     print("Dataset size:", len(dataset_tokens))
+    print("dataset sample:", dataset_tokens[:20])
 
     for epoch in range(num_epochs):
         model.train()
@@ -77,7 +108,9 @@ def train_model():
             total_loss += loss.item()
 
         avg_loss = total_loss / len(list(batchify(dataset_tokens, seq_len, batch_size)))
-        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.4f}")
+        print(f"Epoch {last_saved_epoch + epoch+1}/{num_epochs + last_saved_epoch} | Loss: {avg_loss:.4f}")
+    
+    save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
     
 
 def batchify(tokens, seq_len, batch_size):
@@ -97,20 +130,24 @@ if __name__ == "__main__":
 
     train_model()
 
-    src_tokens = tokenizer.encode("Quel est ton nom ?")
-    bos_id = tokenizer.special_tokens_map.get("<|bos|>")
+    # Après l’entraînement
     eos_id = tokenizer.special_tokens_map.get("<|eos|>")
+    bos_id = tokenizer.special_tokens_map.get("<|bos|>")
+    print(tokenizer.encode("Quel est ton nom ?"))
 
-    out_ids = generate(
+    output_ids = generate(
         model=model,
         tokenizer=tokenizer,
-        start_tokens=[bos_id],   # ce que le décodeur va générer
+        prompt="Quel est ton nom ?",   # texte d’entrée
+        start_tokens=[bos_id],         # ce que le décodeur commence à générer
         max_len=50,
         device=device,
-        eos_id=eos_id
+        eos_id=eos_id,
+        top_k=20,
+        greedy=False
     )
 
-    text = tokenizer.decode(out_ids)
-    print(text)
+    print("Generated IDs:", output_ids)
+    print("Generated text:", tokenizer.decode(output_ids))
 
 

@@ -7,7 +7,7 @@ class Tokenizer():
     def __init__(self, vocab_size=2048):
         self.patterns = re.compile(
             r"(?i)"
-            r"<\|(?:who_i_am|end_who_i_am|bos|eos)\|>|"                       # tokens spéciaux
+            r"<\|(?:who_i_am|end_who_i_am|bos|eos|pad)\|>|"                       # tokens spéciaux
             r".?(?:[cdjlmnst]|qu)'|'(?:[sdmt]|ll|ve|re)|"                     # contractions
             r"[^\r\n\p{L}\p{N}]?+\p{L}++|"                                    # mots (lettres)
             r"\p{N}{1,3}+|"                                                   # nombres
@@ -15,7 +15,7 @@ class Tokenizer():
             r"\s++$|\s*[\r\n]|\s+(?!\S)|\s"
         )
         base_bytes = 256
-        special_tokens = ["<|who_i_am|>", "<end_who_i_am|>", "<|bos|>", "<|eos|>"]
+        special_tokens = ["<|who_i_am|>", "<|end_who_i_am|>", "<|bos|>", "<|eos|>", "<|pad|>"]
         self.special_tokens_map = {token: base_bytes + i for i, token in enumerate(special_tokens)}
 
         self.reserved_after_special_tokens = base_bytes + len(special_tokens)
