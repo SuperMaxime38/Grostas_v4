@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import model as mdl
-import tokenizer as tkn
+from fastbpe import Tokenizer
 import data_loader as dl
 import os
 
@@ -47,7 +47,7 @@ vocab_size = 16384                  # Ton vocabulaire
 seq_len = 256                       # Longueur max de séquence
 embedding_dim = 1024
 batch_size = 8
-num_epochs = 100
+num_epochs = 10
 lr = 1e-5
 
 # Construction du modèle
@@ -58,17 +58,18 @@ model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=0)  # supposer que token 0 = padding
 optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-tokenizer = tkn.Tokenizer(vocab_size)
+tokenizer = Tokenizer(vocab_size)
+
 
 def train_model():
     
-    dataset_tokens = tokenizer.encode(dl.gather_datas())
+    dataset_tokens = tokenizer.encode(dl.gather_messy_datas())
 
     print("Dataset size:", len(dataset_tokens))
-    print("dataset sample:", dataset_tokens[:20])
+    print("dataset sample:", dataset_tokens[:50])
 
+    model.train()
     for epoch in range(num_epochs):
-        model.train()
         total_loss = 0.0
 
         for src, tgt in batchify(dataset_tokens, seq_len, batch_size):
@@ -109,6 +110,10 @@ def train_model():
 
         avg_loss = total_loss / len(list(batchify(dataset_tokens, seq_len, batch_size)))
         print(f"Epoch {last_saved_epoch + epoch+1}/{num_epochs + last_saved_epoch} | Loss: {avg_loss:.4f}")
+
+        if(epoch % 50 == 0):
+            save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
+            print("Saving model...")
     
     save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
     
@@ -132,15 +137,15 @@ if __name__ == "__main__":
 
     # Après l’entraînement
     eos_id = tokenizer.special_tokens_map.get("<|eos|>")
-    bos_id = tokenizer.special_tokens_map.get("<|bos|>")
-    print(tokenizer.encode("Quel est ton nom ?"))
+    bos_tokens = tokenizer.encode("<|who_i_am|>AgentAI<|end_who_i_am|><|bos|>")
+    print(tokenizer.encode("qui est le plus gros des gros tas ?"))
 
     output_ids = generate(
         model=model,
         tokenizer=tokenizer,
-        prompt="Quel est ton nom ?",   # texte d’entrée
-        start_tokens=[bos_id],         # ce que le décodeur commence à générer
-        max_len=50,
+        prompt="qui est le plus gros des gros tas ?",   # texte d’entrée
+        start_tokens=bos_tokens,         # ce que le décodeur commence à générer
+        max_len=128,
         device=device,
         eos_id=eos_id,
         top_k=20,

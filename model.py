@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import tokenizer as Tokenizer
+from fastbpe import Tokenizer
 import data_loader as dl
 import math
 

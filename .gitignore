@@ -1,2 +1,7 @@
 datas/
 checkpoints/
+backup/
+__pycache__/
+merges.json
+vocab.json
+.gitignore

@@ -1,10 +1,10 @@
 import regex as re
-#import get_data_set as gdt
+import get_data_set as gdt
 import json, os
 
 class Tokenizer():
 
-    def __init__(self, vocab_size=2048):
+    def __init__(self, vocab_size=8192):
         self.patterns = re.compile(
             r"(?i)"
             r"<\|(?:who_i_am|end_who_i_am|bos|eos|pad)\|>|"                       # tokens spéciaux
@@ -187,8 +187,8 @@ def load_merges(path):
 
 if __name__ == '__main__':
 
-    tkn = Tokenizer(16384)
-    # tkn.tokenize(gdt.gather_datas())
+    tkn = Tokenizer(24576)
+    tkn.tokenize(gdt.gather_datas())
     mesg = tkn.encode("Mais quel gros tas ! T'es même pas capable de farmer tes primogems toi même gros singe ?! -_-")
     print(mesg)
     print(tkn.decode(mesg))
