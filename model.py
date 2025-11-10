@@ -234,24 +234,6 @@ class Encoder(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
     
-# class DecoderBlock(nn.Module):
-
-#     def __init__(self, self_attention_block: MultiHeadAttentionBlock, cross_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) ->None:
-#         super().__init__()
-#         self.self_attention_block = self_attention_block
-#         self.cross_attention_block = cross_attention_block
-#         self.feed_forward_block = feed_forward_block
-#         self.residual_connection = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
-
-#     def forward(self, x, enc_out, src_mask, tgt_mask): # src_mask is coming from encoder
-#         x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
-#         src_mask = src_mask if src_mask is not None else torch.ones(
-#             (x.size(0), 1, 1, enc_out.size(1)), device=x.device
-#         )
-#         x = self.residual_connection[1](x, lambda x: self.cross_attention_block(x, enc_out, enc_out, src_mask))
-#         x = self.residual_connection[2](x, self.feed_forward_block)
-#         return x
-
 class DecoderBlock(nn.Module):
 
     def __init__(
@@ -269,28 +251,33 @@ class DecoderBlock(nn.Module):
             [ResidualConnection(dropout) for _ in range(3)]
         )
 
-    def forward(self, x, enc_out, src_mask, tgt_mask):
-        # 1️⃣ Self-Attention (masque causal)
-        x = self.residual_connection[0](
-            x, lambda x: self.self_attention_block(x, x, x, tgt_mask)
-        )
+    # def forward(self, x, enc_out, src_mask, tgt_mask):
+    #     # 1️⃣ Self-Attention (masque causal)
+    #     x = self.residual_connection[0](
+    #         x, lambda x: self.self_attention_block(x, x, x, tgt_mask)
+    #     )
 
-        # 2️⃣ Cross-Attention (encoder–decoder)
-        # Assure-toi que src_mask est broadcastable à [batch, num_heads, tgt_len, src_len]
-        batch_size, tgt_len = x.size(0), x.size(1)
-        src_len = enc_out.size(1)
+    #     # 2️⃣ Cross-Attention (encoder–decoder)
+    #     # Assure-toi que src_mask est broadcastable à [batch, num_heads, tgt_len, src_len]
+    #     batch_size, tgt_len = x.size(0), x.size(1)
+    #     src_len = enc_out.size(1)
 
-        if src_mask is None:
-            src_mask = torch.ones((batch_size, 1, tgt_len, src_len), device=x.device)
-        elif src_mask.dim() == 4 and src_mask.size(-2) == 1:
-            # élargit la dimension pour matcher tgt_len si nécessaire
-            src_mask = src_mask.expand(batch_size, 1, tgt_len, src_len)
+    #     if src_mask is None:
+    #         src_mask = torch.ones((batch_size, 1, tgt_len, src_len), device=x.device)
+    #     elif src_mask.dim() == 4 and src_mask.size(-2) == 1:
+    #         # élargit la dimension pour matcher tgt_len si nécessaire
+    #         src_mask = src_mask.expand(batch_size, 1, tgt_len, src_len)
 
-        x = self.residual_connection[1](
-            x, lambda x: self.cross_attention_block(x, enc_out, enc_out, src_mask)
-        )
+    #     x = self.residual_connection[1](
+    #         x, lambda x: self.cross_attention_block(x, enc_out, enc_out, src_mask)
+    #     )
 
-        # 3️⃣ Feed Forward
+    #     # 3️⃣ Feed Forward
+    #     x = self.residual_connection[2](x, self.feed_forward_block)
+    #     return x
+    def forward(self, x, enc_out=None, src_mask=None, tgt_mask=None):
+        x = self.residual_connection[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
+        # on ignore enc_out / src_mask
         x = self.residual_connection[2](x, self.feed_forward_block)
         return x
 
@@ -341,7 +328,45 @@ class Transformer(nn.Module):
     
     def project(self, x):
         return self.projection_layer(x)
-    
+
+class TransformerDecoderOnly(nn.Module):
+    def __init__(self, vocab_size, embedding_dim=1024, num_heads=8,
+                 num_layers=6, dropout=0.1, d_ff=2048, max_seq_len=256):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.pos_encoding = PositionalEncoding(embedding_dim, max_seq_len, dropout)
+
+        self.layers = nn.ModuleList([
+            DecoderBlock(
+                MultiHeadAttentionBlock(embedding_dim, num_heads, dropout),
+                # ici pas de cross-attention
+                None,
+                FeedForwardBlock(embedding_dim, d_ff, dropout),
+                dropout
+            )
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embedding_dim)
+        self.projection = nn.Linear(embedding_dim, vocab_size)
+
+        # Initialisation
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x, mask=None):
+        # Embedding + positionnel
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+
+        for layer in self.layers:
+            # on ignore cross-attention
+            x = layer(x, None, None, mask)
+
+        x = self.norm(x)
+        logits = self.projection(x)
+        return logits
+
 def build_transformer(vocab_size: int, embedding_dim: int = 1024, src_seq_len: int = 256, num_heads: int = 8, num_encoder_layers: int = 6, num_decoder_layers: int = 6, dropout: float = 0.1, d_ff = 2048) -> Transformer:
     # Embedding layers
     src_embedding = InputEmbeddings(vocab_size, embedding_dim)

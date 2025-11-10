@@ -5,8 +5,9 @@ import model as mdl
 from fastbpe import Tokenizer
 import data_loader as dl
 import os
+import numpy as np
 
-from inference import generate
+from inference import generate_decoder_only
 
 # ============================
 # CONFIGURATION DE BASE
@@ -24,13 +25,13 @@ def save_model(model, optimizer, epoch, loss, path="checkpoints/transformer.pt")
     }, path)
     print(f"✅ Modèle sauvegardé dans {path}")
 
-def load_model(model_class, checkpoint_path, device, **model_kwargs):
+def load_model(checkpoint_path, device, **model_kwargs):
     if os.path.exists(checkpoint_path) == False:
-        return model_class(**model_kwargs)
+        return mdl.TransformerDecoderOnly(**model_kwargs)
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # Reconstruit un modèle vierge avec la même architecture
-    model = model_class(**model_kwargs)
+    model = mdl.TransformerDecoderOnly(**model_kwargs)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.train()  # ou .train() si tu veux continuer l'entraînement
 
@@ -43,93 +44,81 @@ def load_model(model_class, checkpoint_path, device, **model_kwargs):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("using device:", device)
 
-vocab_size = 16384                  # Ton vocabulaire
+vocab_size = 24576                  # Ton vocabulaire
 seq_len = 256                       # Longueur max de séquence
 embedding_dim = 1024
 batch_size = 8
-num_epochs = 10
+num_epochs = 80
 lr = 1e-5
 
 # Construction du modèle
-model = mdl.get_model()
-model = load_model(mdl.build_transformer, "checkpoints/transformer.pt", device, vocab_size=vocab_size, src_seq_len=seq_len, embedding_dim=embedding_dim)
+model = mdl.TransformerDecoderOnly(vocab_size, embedding_dim, num_heads=8, num_layers=6, dropout=0.1, d_ff=2048, max_seq_len=128)
+model = load_model("checkpoints/transformer.pt", device, vocab_size=vocab_size, max_seq_len=seq_len, embedding_dim=embedding_dim)
 model = model.to(device)
 
-criterion = nn.CrossEntropyLoss(ignore_index=0)  # supposer que token 0 = padding
-optimizer = optim.AdamW(model.parameters(), lr=lr)
-
 tokenizer = Tokenizer(vocab_size)
+
+criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.special_tokens_map.get("<|pad|>"))  # supposer que token 0 = padding
+optimizer = optim.AdamW(model.parameters(), lr=lr)
 
 
 def train_model():
     
-    dataset_tokens = tokenizer.encode(dl.gather_messy_datas())
+    dataset_tokens = dl.get_data_tokens_as_list()
 
     print("Dataset size:", len(dataset_tokens))
     print("dataset sample:", dataset_tokens[:50])
 
     model.train()
+
     for epoch in range(num_epochs):
-        total_loss = 0.0
-
-        for src, tgt in batchify(dataset_tokens, seq_len, batch_size):
-            if (src < 0).any() or (src >= vocab_size).any():
-                print("src out of range")
-            if (tgt < 0).any() or (tgt >= vocab_size).any():
-                print("tgt out of range")
-            src_mask = None
-            tgt_len = tgt.size(1)
-            # Crée un masque causal 1 (autorisée) / 0 (bloquée)
-            tgt_mask = torch.tril(torch.ones((tgt_len, tgt_len), device=device)).unsqueeze(0).unsqueeze(0)
-            # (1, 1, tgt_len, tgt_len)
-
-            # Forward
-            enc_out = model.encode(src, src_mask)
-            dec_out = model.decode(enc_out, src_mask, tgt, tgt_mask)
-            logits = model.project(dec_out)
-
-            # Calcul de la perte
-            loss = criterion(logits.view(-1, vocab_size), tgt.view(-1))
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                print("Loss NaN or Inf detected before backward")
-                print("Logits:", logits[0, 0, :5])
-                break
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            # Backpropagation
+        total_loss = 0
+        for batch in batchify(dataset_tokens, seq_len, batch_size):
             optimizer.zero_grad()
+
+            batch = torch.tensor(batch, dtype=torch.long, device=device)
+            input_seq = batch[:, :-1]
+            target_seq = batch[:, 1:]
+
+            # masque causal
+            tgt_mask = torch.tril(torch.ones((seq_len-1, seq_len-1), device=device)).unsqueeze(0).unsqueeze(0)
+
+            logits = model(input_seq, tgt_mask)
+            loss = criterion(logits.view(-1, logits.size(-1)), target_seq.reshape(-1))
+
             loss.backward()
-
-            
-
             optimizer.step()
-
             total_loss += loss.item()
 
         avg_loss = total_loss / len(list(batchify(dataset_tokens, seq_len, batch_size)))
         print(f"Epoch {last_saved_epoch + epoch+1}/{num_epochs + last_saved_epoch} | Loss: {avg_loss:.4f}")
 
-        if(epoch % 50 == 0):
+        if((epoch+last_saved_epoch+1) % 50 == 0 and epoch != num_epochs - 1):
             save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
-            print("Saving model...")
+
+            # shuffle dataset
+            dataset_tokens = dl.convert_datas_to_tokens_with_shuffle(tokenizer=tokenizer, random_val=5)
+            print("Shuffled dataset")
     
     save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
     
 
 def batchify(tokens, seq_len, batch_size):
     """
-    Coupe les tokens en séquences de longueur fixe et crée des batchs.
+    Crée des batches rectangulaires à partir d'une liste de tokens.
+    Coupe les séquences à seq_len et forme des batches homogènes.
     """
-    chunks = [tokens[i:i+seq_len+1] for i in range(0, len(tokens)-seq_len, seq_len)]
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i+batch_size]
-        src = [torch.tensor(x[:-1]) for x in batch]
-        tgt = [torch.tensor(x[1:]) for x in batch]
-        src = nn.utils.rnn.pad_sequence(src, batch_first=True)
-        tgt = nn.utils.rnn.pad_sequence(tgt, batch_first=True)
-        yield src.to(device), tgt.to(device)
+    # enlève les derniers tokens non divisibles
+    total_len = (len(tokens) // (seq_len * batch_size)) * (seq_len * batch_size)
+    tokens = tokens[:total_len]
+
+    # transforme en numpy array
+    tokens_np = np.array(tokens, dtype=np.int64)
+    tokens_np = tokens_np.reshape(batch_size, -1)  # (batch_size, N)
+
+    for i in range(0, tokens_np.shape[1] - seq_len, seq_len):
+        batch = tokens_np[:, i:i+seq_len]
+        yield batch
 
 if __name__ == "__main__":
 
@@ -137,20 +126,10 @@ if __name__ == "__main__":
 
     # Après l’entraînement
     eos_id = tokenizer.special_tokens_map.get("<|eos|>")
-    bos_tokens = tokenizer.encode("<|who_i_am|>AgentAI<|end_who_i_am|><|bos|>")
-    print(tokenizer.encode("qui est le plus gros des gros tas ?"))
+    bos_tokens = tokenizer.encode("<|who_i_am|>canward<|end_who_i_am|><|bos|>gros")
+    print(bos_tokens)
 
-    output_ids = generate(
-        model=model,
-        tokenizer=tokenizer,
-        prompt="qui est le plus gros des gros tas ?",   # texte d’entrée
-        start_tokens=bos_tokens,         # ce que le décodeur commence à générer
-        max_len=128,
-        device=device,
-        eos_id=eos_id,
-        top_k=20,
-        greedy=False
-    )
+    output_ids = generate_decoder_only(model=model, start_tokens=bos_tokens, tokenizer=tokenizer, device=device, max_len=128, temperature=1.0, top_k=20, eos_id=eos_id)
 
     print("Generated IDs:", output_ids)
     print("Generated text:", tokenizer.decode(output_ids))
