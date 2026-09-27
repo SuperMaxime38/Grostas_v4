@@ -1,6 +1,6 @@
 import regex as re
-import get_data_set as gdt
 import json, os
+import data_loader as gdt
 
 class Tokenizer():
 

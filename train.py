@@ -6,6 +6,8 @@ from fastbpe import Tokenizer
 import data_loader as dl
 import os
 import numpy as np
+import threading
+import time
 
 from inference import generate_decoder_only
 
@@ -14,8 +16,10 @@ from inference import generate_decoder_only
 # ============================
 
 last_saved_epoch = 0
+torch.cuda.set_per_process_memory_fraction(0.95, device=0)
 
 def save_model(model, optimizer, epoch, loss, path="checkpoints/transformer.pt"):
+    torch.cuda.empty_cache()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         'epoch': epoch,
@@ -48,11 +52,10 @@ vocab_size = 24576                  # Ton vocabulaire
 seq_len = 256                       # Longueur max de séquence
 embedding_dim = 1024
 batch_size = 8
-num_epochs = 80
+num_epochs = 5
 lr = 1e-5
 
 # Construction du modèle
-model = mdl.TransformerDecoderOnly(vocab_size, embedding_dim, num_heads=8, num_layers=6, dropout=0.1, d_ff=2048, max_seq_len=128)
 model = load_model("checkpoints/transformer.pt", device, vocab_size=vocab_size, max_seq_len=seq_len, embedding_dim=embedding_dim)
 model = model.to(device)
 
@@ -61,63 +64,118 @@ tokenizer = Tokenizer(vocab_size)
 criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.special_tokens_map.get("<|pad|>"))  # supposer que token 0 = padding
 optimizer = optim.AdamW(model.parameters(), lr=lr)
 
+n_params = sum(p.numel() for p in model.parameters())
+print(f"{n_params:,} paramètres ({n_params/1e6:.1f}M)")
 
+CONTROL_FILE = "training_control.txt"
+
+def check_control(epoch, avg_loss):
+    """
+    Lit un fichier de contrôle pour réguler l'entraînement en direct.
+    Contenu possible dans le fichier :
+      "pause"        -> met en pause jusqu'à changement du fichier
+      un nombre (ex: "0.5") -> attend ce délai (en secondes) après le step
+      "run" ou fichier absent -> vitesse normale
+    """
+    if not os.path.exists(CONTROL_FILE):
+        return
+
+    while True:
+        try:
+            with open(CONTROL_FILE, "r") as f:
+                content = f.read().strip().lower()
+        except (FileNotFoundError, PermissionError):
+            return
+
+        if content == "pause":
+            time.sleep(1)
+            continue  # revérifie après 1s, reste en pause tant que le fichier dit "pause"
+        elif content == "save":
+            with open(CONTROL_FILE, "w+") as fw:
+                save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
+                fw.write("pause")
+                fw.close()
+            return
+        elif content in ("run", ""):
+            return
+        else:
+            try:
+                time.sleep(float(content))
+            except ValueError:
+                pass
+            return
 def train_model():
-    
-    dataset_tokens = dl.get_data_tokens_as_list()
-
-    print("Dataset size:", len(dataset_tokens))
-    print("dataset sample:", dataset_tokens[:50])
-
     model.train()
+    scaler = torch.amp.GradScaler('cuda')  # créé une seule fois
+
+    accum_steps = 4  # batch effectif = micro_batch_size * accum_steps = 8
 
     for epoch in range(num_epochs):
-        total_loss = 0
-        for batch in batchify(dataset_tokens, seq_len, batch_size):
-            optimizer.zero_grad()
+        total_loss = 0.0
+        n_micro_batches = 0
+        optimizer.zero_grad()
 
+        for i, batch in enumerate(batchify(os.path.join("datas\\tokenized", "tokens.bin"), seq_len, batch_size // accum_steps, dtype=np.uint32)):
             batch = torch.tensor(batch, dtype=torch.long, device=device)
             input_seq = batch[:, :-1]
             target_seq = batch[:, 1:]
-
-            # masque causal
             tgt_mask = torch.tril(torch.ones((seq_len-1, seq_len-1), device=device)).unsqueeze(0).unsqueeze(0)
 
-            logits = model(input_seq, tgt_mask)
-            loss = criterion(logits.view(-1, logits.size(-1)), target_seq.reshape(-1))
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                logits = model(input_seq, tgt_mask)
+                loss = criterion(logits.view(-1, logits.size(-1)), target_seq.reshape(-1))
 
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            scaler.scale(loss / accum_steps).backward()
 
-        avg_loss = total_loss / len(list(batchify(dataset_tokens, seq_len, batch_size)))
+            total_loss += loss.item()  # loss réel, non divisé -> logging correct
+            n_micro_batches += 1
+
+            if (i + 1) % accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                check_control(epoch, total_loss / n_micro_batches)
+
+        # flush du dernier groupe incomplet, pour ne pas polluer l'epoch suivante
+        if n_micro_batches % accum_steps != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        avg_loss = total_loss / n_micro_batches
         print(f"Epoch {last_saved_epoch + epoch+1}/{num_epochs + last_saved_epoch} | Loss: {avg_loss:.4f}")
 
-        if((epoch+last_saved_epoch+1) % 50 == 0 and epoch != num_epochs - 1):
+        if (epoch + last_saved_epoch + 1) % 10 == 0 and epoch != num_epochs - 1:
             save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
 
-            # shuffle dataset
-            dataset_tokens = dl.convert_datas_to_tokens_with_shuffle(tokenizer=tokenizer, random_val=5)
-            print("Shuffled dataset")
-    
     save_model(model, optimizer, epoch + last_saved_epoch + 1, avg_loss, "checkpoints/transformer.pt")
     
 
-def batchify(tokens, seq_len, batch_size):
+def batchify(path, seq_len, batch_size, dtype=np.uint32):
     """
-    Crée des batches rectangulaires à partir d'une liste de tokens.
-    Coupe les séquences à seq_len et forme des batches homogènes.
+    Crée des batches rectangulaires à partir d'un fichier de tokens
+    trop gros pour tenir en RAM, via memory-mapping.
+
+    Le fichier doit contenir des tokens en binaire brut, stockés
+    avec `dtype` (ex: np.uint16 si vocab < 65536).
     """
-    # enlève les derniers tokens non divisibles
-    total_len = (len(tokens) // (seq_len * batch_size)) * (seq_len * batch_size)
-    tokens = tokens[:total_len]
+    itemsize = np.dtype(dtype).itemsize
+    file_size = os.path.getsize(path)
+    total_tokens = file_size // itemsize
 
-    # transforme en numpy array
-    tokens_np = np.array(tokens, dtype=np.int64)
-    tokens_np = tokens_np.reshape(batch_size, -1)  # (batch_size, N)
+    # nombre de tokens utilisables (divisible par seq_len * batch_size)
+    total_len = (total_tokens // (seq_len * batch_size)) * (seq_len * batch_size)
+    n_per_row = total_len // batch_size
 
-    for i in range(0, tokens_np.shape[1] - seq_len, seq_len):
-        batch = tokens_np[:, i:i+seq_len]
+    # mmap : ne charge rien en RAM tant qu'on n'accède pas aux données
+    mm = np.memmap(path, dtype=dtype, mode='r', shape=(total_tokens,))
+
+    # vue reshape (batch_size, n_per_row) - pas de copie, toujours mmap
+    tokens_view = mm[:total_len].reshape(batch_size, n_per_row)
+
+    for i in range(0, n_per_row - seq_len, seq_len):
+        # ce slice déclenche la lecture disque des SEULES pages concernées
+        batch = np.array(tokens_view[:, i:i+seq_len])  # copie -> vrai ndarray en RAM
         yield batch
 
 if __name__ == "__main__":
@@ -126,12 +184,15 @@ if __name__ == "__main__":
 
     # Après l’entraînement
     eos_id = tokenizer.special_tokens_map.get("<|eos|>")
-    bos_tokens = tokenizer.encode("<|who_i_am|>canward<|end_who_i_am|><|bos|>gros")
+    # bos_tokens = tokenizer.encode("<|who_i_am|>maxime38<|end_who_i_am|><|bos|>")
+    bos_tokens = tokenizer.encode("<|who_i_am|>canward<|end_who_i_am|><|bos|>")
     print(bos_tokens)
 
-    output_ids = generate_decoder_only(model=model, start_tokens=bos_tokens, tokenizer=tokenizer, device=device, max_len=128, temperature=1.0, top_k=20, eos_id=eos_id)
+    for i in range(4):
 
-    print("Generated IDs:", output_ids)
-    print("Generated text:", tokenizer.decode(output_ids))
+        output_ids = generate_decoder_only(model=model, start_tokens=bos_tokens, tokenizer=tokenizer, device=device, max_len=128, temperature=1.0, top_k=20, eos_id=eos_id)
+
+        # print("Generated IDs:", output_ids)
+        print("Generated text:", tokenizer.decode(output_ids))
 
 

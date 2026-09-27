@@ -3,6 +3,7 @@ import torch.nn as nn
 from fastbpe import Tokenizer
 import data_loader as dl
 import math
+from torch.utils.checkpoint import checkpoint
 
 import torch.nn.functional as F
 
@@ -72,67 +73,6 @@ class FeedForwardBlock(nn.Module):
         x = self.dropout(torch.relu(self.linear_1(x)))
         x = self.linear_2(x)
         return x
-    
-# class MultiHeadAttentionBlock(nn.Module):
-
-#     def __init__(self, embedding_dim: int, num_heads: int, dropout: float) -> None:
-#         super().__init__()
-#         self.embedding_dim = embedding_dim
-#         self.num_heads = num_heads
-#         assert embedding_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads"
-#         self.head_dim = embedding_dim // num_heads #called d_k in the paper
-
-#         self.w_q = nn.Linear(embedding_dim, embedding_dim)
-#         self.w_k = nn.Linear(embedding_dim, embedding_dim)
-#         self.w_v = nn.Linear(embedding_dim, embedding_dim)
-
-#         self.linear_out = nn.Linear(embedding_dim, embedding_dim) # W_o in the paper
-
-#         self.dropout = nn.Dropout(dropout)
-
-#     @staticmethod
-#     def attention(query, key, value, dropout: nn.Dropout, mask=None):
-#         d_k = query.size(-1)
-#         scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
-
-#         if mask is not None:
-#             # Vérifie que mask est broadcastable
-#             if mask.dim() == 2:
-#                 mask = mask.unsqueeze(0).unsqueeze(0)
-#             elif mask.dim() == 3:
-#                 mask = mask.unsqueeze(1)
-#             scores = scores.masked_fill(mask == 0, float('-inf'))
-
-#         # Stabilisation numérique : soustraction du max
-#         scores = scores - scores.max(dim=-1, keepdim=True).values
-#         attn = scores.softmax(dim=-1)
-
-#         if dropout is not None:
-#             attn = dropout(attn)
-
-
-#         output = attn @ value
-#         return output, attn
-
-
-#     def forward(self, v, k, q, mask=None):
-#         query = self.w_q(q) #   (Batch, sequence_length, embedding_dim) --> (Batch, sequence_length, embedding_dim)
-#         key = self.w_k(k) #     (Batch, sequence_length, embedding_dim) --> (Batch, sequence_length, embedding_dim)
-#         value = self.w_v(v) #   (Batch, sequence_length, embedding_dim) --> (Batch, sequence_length, embedding_dim)
-
-#         query = query.view(query.shape[0], query.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (Batch, num_heads, sequence_length, head_dim)
-#         key = key.view(key.shape[0], key.shape[1], self.num_heads, self.head_dim).transpose(1, 2) #         (Batch, num_heads, sequence_length, head_dim)
-#         value = value.view(value.shape[0], value.shape[1], self.num_heads, self.head_dim).transpose(1, 2) # (Batch, num_heads, sequence_length, head_dim)
-
-#         x, self.attention_score = MultiHeadAttentionBlock.attention(query, key, value, self.dropout, mask)
-
-#         # (Batch, num_heads, sequence_length, head_dim) --> (Batch, sequence_length, embedding_dim)
-#         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.embedding_dim)
-
-#         # (Batch, sequence_length, embedding_dim)
-#         return self.linear_out(x)
-
-
 class MultiHeadAttentionBlock(nn.Module):
     def __init__(self, embedding_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -193,7 +133,14 @@ class MultiHeadAttentionBlock(nn.Module):
         # query, key, value : (B, H, seq_len, head_dim)
 
         # 2️⃣ Attention multi-têtes
-        x, self.attention_score = self.attention(query, key, value, self.dropout, mask)
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask.bool()
+
+        x = F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=mask,
+        dropout_p=self.dropout.p if self.training else 0.0
+        )
 
         # 3️⃣ Recombine les têtes
         x = x.transpose(1, 2).contiguous().view(B, tgt_len, self.embedding_dim)
@@ -361,7 +308,7 @@ class TransformerDecoderOnly(nn.Module):
 
         for layer in self.layers:
             # on ignore cross-attention
-            x = layer(x, None, None, mask)
+            x = checkpoint(layer, x, None, None, mask, use_reentrant=False)
 
         x = self.norm(x)
         logits = self.projection(x)

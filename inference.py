@@ -63,15 +63,6 @@ def generate_decoder_only(model, start_tokens, tokenizer, device, max_len=128,
 
     return generated.squeeze(0).tolist()
 
-def save_model(model, optimizer, epoch, loss, path="checkpoints/transformer.pt"):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }, path)
-    print(f"✅ Modèle sauvegardé dans {path}")
 
 def load_model(model_class, checkpoint_path, device, **model_kwargs):
     checkpoint = torch.load(checkpoint_path, map_location=device)
